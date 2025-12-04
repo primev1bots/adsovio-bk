@@ -22,13 +22,18 @@ const rateLimit = require('express-rate-limit');
 const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
+const https = require('https');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ================= 1. CONFIGURATION & LISTS =================
 
-// Paths to MaxMind Databases
+// Remote URLs for MaxMind Databases
+const DB_URL_CITY = "https://notix.baduz.icu/GeoLite2-City.mmdb";
+const DB_URL_ASN = "https://notix.baduz.icu/GeoLite2-ASN.mmdb";
+
+// Local paths to save downloaded databases
 const DB_PATH_CITY = path.join(__dirname, 'db', 'GeoLite2-City.mmdb');
 const DB_PATH_ASN = path.join(__dirname, 'db', 'GeoLite2-ASN.mmdb');
 
@@ -53,10 +58,40 @@ const TIER_1_COUNTRIES = ['US', 'GB', 'CA', 'AU', 'DE', 'CH', 'NO', 'NZ', 'SE', 
 // Tier 2: Mid eCPM (Mixed Priority)
 const TIER_2_COUNTRIES = ['IT', 'ES', 'BE', 'DK', 'FI', 'AE', 'SA', 'SG', 'KR', 'JP', 'QA'];
 
-// Tier 3: Rest of the World (Priority: OnClicka for Fill Rate)
-// (Logic: If not Tier 1 and not Tier 2 -> Then Tier 3)
+// ================= 2. DATABASE DOWNLOAD HELPER =================
 
-// ================= 2. DATABASE SETUP =================
+// Helper function to download database files
+function downloadDatabase(url, filePath) {
+    return new Promise((resolve, reject) => {
+        // Create directory if it doesn't exist
+        const dir = path.dirname(filePath);
+        if (!fs.existsSync(dir)) {
+            fs.mkdirSync(dir, { recursive: true });
+        }
+
+        const file = fs.createWriteStream(filePath);
+        
+        https.get(url, (response) => {
+            if (response.statusCode !== 200) {
+                reject(new Error(`Failed to download: ${url} - Status: ${response.statusCode}`));
+                return;
+            }
+
+            response.pipe(file);
+            
+            file.on('finish', () => {
+                file.close();
+                console.log(`✅ Downloaded: ${path.basename(filePath)}`);
+                resolve(filePath);
+            });
+        }).on('error', (err) => {
+            fs.unlink(filePath, () => {}); // Delete partial file on error
+            reject(err);
+        });
+    });
+}
+
+// ================= 3. DATABASE SETUP =================
 mongoose.connect(MONGO_URI)
     .then(() => console.log("✅ [MongoDB] Connected to Adsovio Cluster"))
     .catch(err => console.error("❌ [MongoDB] Connection Failed:", err));
@@ -78,22 +113,70 @@ const TrafficLogSchema = new mongoose.Schema({
 
 const TrafficLog = mongoose.model('TrafficLog', TrafficLogSchema);
 
-// ================= 3. MAXMIND & HELPERS =================
+// ================= 4. MAXMIND & HELPERS =================
 let cityLookup = null;
 let asnLookup = null;
 
-// Load Databases Async
+// Load Databases with Download Function
 async function loadDatabases() {
     try {
-        if (fs.existsSync(DB_PATH_CITY) && fs.existsSync(DB_PATH_ASN)) {
+        // Check if files already exist
+        const cityFileExists = fs.existsSync(DB_PATH_CITY);
+        const asnFileExists = fs.existsSync(DB_PATH_ASN);
+        
+        // Download if files don't exist
+        if (!cityFileExists) {
+            console.log("📥 Downloading GeoLite2 City database...");
+            await downloadDatabase(DB_URL_CITY, DB_PATH_CITY);
+        }
+        
+        if (!asnFileExists) {
+            console.log("📥 Downloading GeoLite2 ASN database...");
+            await downloadDatabase(DB_URL_ASN, DB_PATH_ASN);
+        }
+        
+        // Load databases
+        cityLookup = await maxmind.open(DB_PATH_CITY);
+        asnLookup = await maxmind.open(DB_PATH_ASN);
+        console.log("✅ [MaxMind] GeoIP Engine Loaded.");
+        
+        // Schedule daily update (optional)
+        // updateDatabasesDaily();
+        
+    } catch (e) {
+        console.error("❌ DB Load Error:", e.message);
+        // Fallback: Try to use existing files even if download failed
+        try {
+            if (fs.existsSync(DB_PATH_CITY)) {
+                cityLookup = await maxmind.open(DB_PATH_CITY);
+            }
+            if (fs.existsSync(DB_PATH_ASN)) {
+                asnLookup = await maxmind.open(DB_PATH_ASN);
+            }
+        } catch (fallbackError) {
+            console.error("❌ Fallback also failed:", fallbackError.message);
+        }
+    }
+}
+
+// Optional: Daily update function
+function updateDatabasesDaily() {
+    setInterval(async () => {
+        console.log("🔄 Updating GeoIP databases...");
+        try {
+            await downloadDatabase(DB_URL_CITY, DB_PATH_CITY);
+            await downloadDatabase(DB_URL_ASN, DB_PATH_ASN);
+            
+            // Reload databases
             cityLookup = await maxmind.open(DB_PATH_CITY);
             asnLookup = await maxmind.open(DB_PATH_ASN);
-            console.log("✅ [MaxMind] GeoIP Engine Loaded.");
-        } else {
-            console.error("❌ [Critical] DB files missing in /db folder!");
+            console.log("✅ GeoIP databases updated successfully.");
+        } catch (e) {
+            console.error("❌ Failed to update databases:", e.message);
         }
-    } catch (e) { console.error("DB Load Error:", e); }
+    }, 24 * 60 * 60 * 1000); // 24 hours
 }
+
 loadDatabases();
 
 // Telegram Data Validator (HMAC SHA256)
@@ -123,7 +206,7 @@ function verifyTelegramData(initData) {
     } catch (e) { return { valid: false, reason: "parse_error" }; }
 }
 
-// ================= 4. MIDDLEWARE =================
+// ================= 5. MIDDLEWARE =================
 app.use(cors({ origin: '*' })); // প্রোডাকশনে আপনার ডোমেইন দিন
 app.use(express.json());
 app.use(requestIp.mw());
@@ -134,7 +217,7 @@ app.use(morgan('tiny'));
 const limiter = rateLimit({ windowMs: 60 * 1000, max: 50 });
 app.use('/api/', limiter);
 
-// ================= 5. TRAFFIC ANALYSIS ENGINE =================
+// ================= 6. TRAFFIC ANALYSIS ENGINE =================
 async function analyzeTraffic(req, inputData) {
     // DB ফেইল করলে বাইপাস (Revenue Loss ঠেকানো)
     if (!cityLookup || !asnLookup) return { status: 'allowed', ad_config: { priority: 'monetag' } };
@@ -267,7 +350,7 @@ async function analyzeTraffic(req, inputData) {
     }
 }
 
-// ================= 6. ROUTES =================
+// ================= 7. ROUTES =================
 app.post('/api/v1/validate-traffic', async (req, res) => {
     const result = await analyzeTraffic(req, req.body);
     res.json(result);
@@ -278,7 +361,23 @@ app.get('/', (req, res) => {
     res.send("Adsovio Secure Engine v2.0 is Running...");
 });
 
-// ================= 7. SERVER START =================
+// Database Download Endpoint (Manual trigger)
+app.get('/api/update-databases', async (req, res) => {
+    try {
+        await downloadDatabase(DB_URL_CITY, DB_PATH_CITY);
+        await downloadDatabase(DB_URL_ASN, DB_PATH_ASN);
+        
+        // Reload databases
+        cityLookup = await maxmind.open(DB_PATH_CITY);
+        asnLookup = await maxmind.open(DB_PATH_ASN);
+        
+        res.json({ success: true, message: "Databases updated successfully" });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// ================= 8. SERVER START =================
 app.listen(PORT, () => {
     console.log(`
     ################################################
@@ -287,6 +386,7 @@ app.listen(PORT, () => {
     🛡️ VPN Policy: 40% Allowed / 60% Blocked
     🌍 Tier System: 1 (Monetag), 3 (OnClicka)
     📊 Analytics: MongoDB Connected
+    📥 GeoIP: Remote Download Enabled
     ################################################
     `);
 });
